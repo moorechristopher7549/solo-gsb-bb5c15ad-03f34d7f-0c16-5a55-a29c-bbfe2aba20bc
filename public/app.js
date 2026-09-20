@@ -22,6 +22,7 @@ const state = {
   probStale: false,       // 推演之后剧情又被编辑过
   covResult: null,        // 最近一次选项覆盖路线结果
   covStale: false,        // 生成路线之后剧情又被编辑过
+  covReplay: null,        // 逐步回放状态 { routeIndex, result, cursor, stale, running }
   dirty: false,
   saving: false,
 };
@@ -83,6 +84,7 @@ async function openStory(id) {
   state.probStale = false;
   state.covResult = null;
   state.covStale = false;
+  state.covReplay = null;
   $('storySelect').value = id;
   renderAll();
   await runAnalysis(false);
@@ -148,6 +150,7 @@ async function deleteStory() {
   state.probStale = false;
   state.covResult = null;
   state.covStale = false;
+  state.covReplay = null;
   const next = await loadList();
   if (next) await openStory(next);
   else { renderAll(); toast('已删除'); }
@@ -1150,10 +1153,11 @@ function renderProbabilityResult() {
  * 选项覆盖路线
  * ============================================================ */
 function markCoverageStale() {
-  if (!state.covResult) return;
-  state.covStale = true;
+  if (state.covResult) state.covStale = true;
+  // 回放针对的是当前草稿：草稿再被编辑后，已展示的逐步回放同样可能过期
+  if (state.covReplay && state.covReplay.running) state.covReplay.stale = true;
   const el = $('covStale');
-  if (el) el.hidden = false;
+  if (el) el.hidden = !state.covStale;
 }
 
 async function runCoverage() {
@@ -1162,6 +1166,8 @@ async function runCoverage() {
     // 对编辑中的草稿直接生成（不落盘）
     state.covResult = await api('POST', '/api/coverage', state.story);
     state.covStale = false;
+    // 旧路线对应的回放随新结果一起作废
+    state.covReplay = null;
     renderCoveragePanel();
   } catch (e) {
     toast(`生成覆盖路线失败：${e.message}`);
@@ -1172,7 +1178,11 @@ function renderCoveragePanel() {
   const card = $('covCard');
   if (!state.story) { card.hidden = true; return; }
   card.hidden = false;
+  // 回放面板内容较多：回放中放开卡片高度上限，避免面板内部双层滚动条
+  card.classList.toggle('replay-open', !!(state.covReplay && state.covReplay.running));
   $('covStale').hidden = !state.covStale;
+  renderCoverageReplayBar();
+  renderCoverageReplay();
   renderCoverageResult();
 }
 
@@ -1292,11 +1302,29 @@ function renderCoverageResult() {
   r.routes.forEach((route, i) => {
     const det = document.createElement('details');
     det.className = 'cov-route';
-    if (i === 0) det.open = true;
+    const replaying = state.covReplay && state.covReplay.running &&
+      state.covReplay.routeIndex === route.index;
+    if (replaying) { det.classList.add('is-replaying'); det.open = true; }
+    else if (i === 0) det.open = true;
     const sum = document.createElement('summary');
     sum.innerHTML = `<span>路线 ${route.index} · ${route.depth} 步</span>`
       + `<span class="badge badge-ok">新覆盖 ${route.newlyCovered.length}</span>`
       + `<span class="badge badge-muted">共覆盖 ${route.covers.length}</span>`;
+    const playBtn = document.createElement('button');
+    playBtn.className = 'btn btn-small cov-play-btn' + (replaying ? ' active' : '');
+    playBtn.textContent = replaying ? '● 回放中' : '▶ 逐步回放';
+    playBtn.title = '用当前草稿从起点按路线中的稳定选项 UID 逐步重新校验（不保存草稿）';
+    playBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (replaying) {
+        det.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        $('covReplay').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } else {
+        startCoverageReplay(route);
+      }
+    });
+    sum.appendChild(playBtn);
     det.appendChild(sum);
     const body = document.createElement('div');
     body.className = 'cov-route-body';
@@ -1324,6 +1352,480 @@ function renderCoverageResult() {
       box.appendChild(row);
     }
   }
+}
+
+
+/* ============================================================
+ * 覆盖路线逐步回放（用当前草稿重新校验，不保存 / 不修改草稿）
+ * ============================================================ */
+const REPLAY_DIVERGENCE_META = {
+  startSceneChanged: { label: '起点变更', cls: 'pq-err' },
+  startPreconditionFailed: { label: '起点前置不成立', cls: 'pq-err' },
+  stateMismatch: { label: '状态不一致', cls: 'pq-warn' },
+  optionUidMissing: { label: '选项 UID 缺失', cls: 'pq-err' },
+  optionSceneMoved: { label: '选项不在原场景', cls: 'pq-err' },
+  optionConditionFalse: { label: '选项条件不成立', cls: 'pq-err' },
+  optionOrphan: { label: '悬空跳转', cls: 'pq-err' },
+  optionTargetChanged: { label: '跳转目标变更', cls: 'pq-warn' },
+  targetPreconditionFalse: { label: '目标前置不成立', cls: 'pq-err' },
+};
+
+/** 选中一条路线并开始回放：先针对当前草稿完整重新校验一次 */
+async function startCoverageReplay(route) {
+  if (!state.story || !state.covResult) return;
+  state.covReplay = {
+    routeIndex: route.index,
+    route,
+    result: null,
+    cursor: 0,
+    stale: state.covStale,
+    running: true,
+  };
+  renderCoveragePanel();
+  await fetchCoverageReplay(route);
+  // 播放按钮在下方路线列表里，回放面板在卡片顶部：开始后把它滚动到可视区
+  $('covReplay').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** 用当前草稿向后端请求一次完整回放（不落盘），游标收敛到首个分歧点以内 */
+async function fetchCoverageReplay(route) {
+  if (!state.covReplay) return;
+  const previousCursor = state.covReplay.cursor;
+  try {
+    const result = await api('POST', '/api/coverage/replay', {
+      story: state.story,
+      route,
+    });
+    const replay = state.covReplay;
+    replay.result = result;
+    replay.stale = false;
+    // 服务端给出当前草稿下首个分歧点（completed 时为路线终点）；
+    // stopStep 是界面应停在的场景步位（状态不一致 / 入口受阻发生在执行选项后）。
+    // 保留用户当前步位，但不能越过首个分歧点。
+    const limit = result.completed ? result.totalSteps : result.divergence.stopStep;
+    replay.cursor = Math.min(previousCursor, limit);
+    renderCoveragePanel();
+  } catch (e) {
+    state.covReplay = null;
+    renderCoveragePanel();
+    toast(`回放失败：${e.message}`);
+  }
+}
+
+/** 回放当前可停留的最大步位：完成时为终点，否则为首个分歧点所在场景步位 */
+function replayLimit(result) {
+  return result.completed ? result.totalSteps : result.divergence.stopStep;
+}
+
+/** 「下一步」：重新用当前草稿校验整条路线，游标前进一步（草稿若已变，
+ *  后端可能在更早的步骤就返回分歧，游标自动停在新的首个分歧点） */
+async function replayStepForward() {
+  const replay = state.covReplay;
+  if (!replay || !replay.result) return;
+  const result = replay.result;
+  // 已停在分歧点或终点：仅用当前草稿重新校验，游标由 fetchCoverageReplay 定位
+  const blocked = replay.cursor >= replayLimit(result);
+  if (!blocked) replay.cursor = Math.min(result.totalSteps, replay.cursor + 1);
+  await fetchCoverageReplay(replay.route);
+}
+
+async function replayRestart() {
+  const replay = state.covReplay;
+  if (!replay) return;
+  replay.cursor = 0;
+  await fetchCoverageReplay(replay.route);
+}
+
+function closeCoverageReplay() {
+  state.covReplay = null;
+  renderCoveragePanel();
+}
+
+/** 分歧点上的「重新生成覆盖路线」：按当前草稿重新生成并切换到新路线集 */
+async function replayRegenerate() {
+  await runCoverage();
+  toast('已按当前草稿重新生成覆盖路线');
+  $('covResult').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** 回放工具条：选择路线 + 关闭 */
+function renderCoverageReplayBar() {
+  const bar = $('covReplayBar');
+  bar.innerHTML = '';
+  const r = state.covResult;
+  if (!r || !state.story || !r.routes || !r.routes.length) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const replay = state.covReplay;
+
+  const sel = document.createElement('select');
+  sel.className = 'cov-replay-select';
+  r.routes.forEach((route) => {
+    const opt = document.createElement('option');
+    opt.value = String(route.index);
+    opt.textContent = `路线 ${route.index} · ${route.depth} 步（${route.covers.length} 个选项）`;
+    sel.appendChild(opt);
+  });
+  if (replay && replay.running) sel.value = String(replay.routeIndex);
+  sel.addEventListener('change', () => {
+    const route = r.routes.find((x) => x.index === Number(sel.value));
+    if (route) startCoverageReplay(route);
+  });
+  bar.appendChild(sel);
+
+  const hint = document.createElement('span');
+  hint.className = 'cov-replay-hint';
+  hint.textContent = '选择路线后可从起点按稳定选项 UID 逐步回放，每步都用当前草稿重新校验';
+  bar.appendChild(hint);
+}
+
+/** 主回放面板：当前场景 / 变量状态 / 下一步选项 + 分歧对照 */
+function renderCoverageReplay() {
+  const box = $('covReplay');
+  box.innerHTML = '';
+  const replay = state.covReplay;
+  const r = state.covResult;
+  if (!replay || !replay.running || !r || !state.story) { box.hidden = true; return; }
+  box.hidden = false;
+  const result = replay.result;
+  if (!result) {
+    const loading = document.createElement('div');
+    loading.className = 'pq-note';
+    loading.textContent = '正在用当前草稿重新校验路线…';
+    box.appendChild(loading);
+    return;
+  }
+
+  // ---- 头部：路线 / 步位 / 过期提示 ----
+  const head = document.createElement('div');
+  head.className = 'cov-replay-head';
+  head.innerHTML = `<b>逐步回放 · 路线 ${result.routeIndex == null ? replay.routeIndex : result.routeIndex}</b>`;
+  let stepTxt;
+  if (result.completed) {
+    stepTxt = replay.cursor >= result.totalSteps
+      ? `第 ${result.totalSteps} / ${result.totalSteps} 步（已走完全程）`
+      : `第 ${replay.cursor} / ${result.totalSteps} 步`;
+  } else if (replay.cursor >= result.divergence.stopStep) {
+    const afterExecuted = result.divergence.stopStep > result.divergence.step;
+    stepTxt = `第 ${result.divergence.stopStep} / ${result.totalSteps} 步 · 已停在首个分歧点`
+      + (afterExecuted ? `（执行第 ${result.divergence.step + 1} 个选项后）` : '');
+  } else {
+    stepTxt = `第 ${replay.cursor} / ${result.totalSteps} 步 · 第 ${result.divergence.step + 1} 个选项处有分歧`;
+  }
+  const pos = document.createElement('span');
+  pos.className = 'cov-replay-pos';
+  pos.textContent = stepTxt;
+  head.appendChild(pos);
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'btn btn-small cov-replay-close';
+  closeBtn.textContent = '✕ 退出回放';
+  closeBtn.addEventListener('click', closeCoverageReplay);
+  head.appendChild(closeBtn);
+  box.appendChild(head);
+
+  if (replay.stale || state.covStale) {
+    const warn = document.createElement('div');
+    warn.className = 'pq-banner pq-warn cov-replay-stale';
+    warn.textContent = '⚠ 草稿在上次校验后又被修改：以下回放基于的草稿已过期，点击「用当前草稿重新校验」或「下一步」可立即复核；若路线已失效，可直接重新生成覆盖路线。';
+    box.appendChild(warn);
+  }
+
+  // ---- 已走轨迹（0..cursor 的场景与选项帧） ----
+  const trailLabel = document.createElement('div');
+  trailLabel.className = 'cov-section-label';
+  trailLabel.textContent = '已走轨迹（当前场景高亮）';
+  box.appendChild(trailLabel);
+  box.appendChild(buildReplayTrail(result, replay.cursor));
+
+  // ---- 当前场景面板 ----
+  const curScene = framesUpTo(result, replay.cursor).scenes.slice(-1)[0];
+  if (curScene) box.appendChild(buildReplaySceneCard(curScene, result, replay));
+
+  // ---- 分歧 / 完成提示 ----
+  if (!result.completed && replay.cursor >= result.divergence.stopStep) {
+    box.appendChild(buildDivergenceCard(result, replay));
+  } else if (result.completed && replay.cursor >= result.totalSteps) {
+    const done = document.createElement('div');
+    done.className = 'pq-banner pq-ok';
+    done.textContent = `✓ 路线 ${result.totalSteps} 步全部与当前草稿一致：每个选项条件、目标前置与状态赋值均校验通过。`;
+    box.appendChild(done);
+  }
+
+  if (result.conditionErrors && result.conditionErrors.length) {
+    const note = document.createElement('div');
+    note.className = 'pq-note';
+    note.textContent = `当前草稿存在 ${result.conditionErrors.length} 处条件语法错误，回放时按恒真处理（详见一致性分析）。`;
+    box.appendChild(note);
+  }
+
+  // ---- 操作按钮 ----
+  const actions = document.createElement('div');
+  actions.className = 'cov-replay-actions';
+  const atEnd = replay.cursor >= replayLimit(result);
+
+  const nextBtn = document.createElement('button');
+  nextBtn.className = 'btn btn-small btn-primary';
+  if (result.completed && replay.cursor >= result.totalSteps) {
+    nextBtn.textContent = '✓ 已到终点';
+    nextBtn.disabled = true;
+  } else if (atEnd) {
+    nextBtn.textContent = '↻ 用当前草稿重新校验';
+  } else {
+    nextBtn.textContent = '下一步 ▶';
+  }
+  nextBtn.addEventListener('click', replayStepForward);
+  actions.appendChild(nextBtn);
+
+  const restartBtn = document.createElement('button');
+  restartBtn.className = 'btn btn-small';
+  restartBtn.textContent = '⏮ 回到起点';
+  restartBtn.disabled = replay.cursor === 0 && !atEnd;
+  restartBtn.addEventListener('click', replayRestart);
+  actions.appendChild(restartBtn);
+
+  const regenBtn = document.createElement('button');
+  regen.className = 'btn btn-small';
+  regen.textContent = '🔄 重新生成覆盖路线';
+  regen.title = '按当前草稿重新生成覆盖路线（回放不保存草稿，此操作同样不落盘）';
+  regen.addEventListener('click', replayRegenerate);
+  actions.appendChild(regenBtn);
+  box.appendChild(actions);
+}
+
+/** 截止游标处的帧拆分（场景帧 / 选项帧）与下一期望选项信息 */
+function framesUpTo(result, cursor) {
+  // frames 形如 scene(step0), option(step0), scene(step1), ...
+  // 游标 k = 已选过 k 个选项：展示 step <= k 的场景帧与 step < k 的选项帧
+  const scenes = [];
+  const options = [];
+  for (const f of result.frames) {
+    if (f.kind === 'scene') {
+      if (f.step <= cursor) scenes.push(f);
+    } else if (f.step < cursor) {
+      options.push(f);
+    }
+  }
+  return { scenes, options };
+}
+
+function buildReplayTrail(result, cursor) {
+  const wrap = document.createElement('div');
+  wrap.className = 'path-view cov-replay-trail';
+  const { scenes, options } = framesUpTo(result, cursor);
+  const optByStep = new Map(options.map((o) => [o.step, o]));
+  scenes.forEach((sc, i) => {
+    const div = document.createElement('div');
+    const isCur = i === scenes.length - 1;
+    div.className = 'path-node scene' + (i === 0 ? ' start' : '') + (isCur ? ' replay-current' : '')
+      + (sc.blockedEntry ? ' blocked' : '');
+    const badge = i === 0 ? '<span class="badge badge-ok">起点</span>'
+      : isCur ? '<span class="badge badge-req">当前</span>' : '';
+    div.innerHTML = `<span class="pn-title"></span><span class="pn-id"></span>${badge}`;
+    div.querySelector('.pn-title').textContent = sc.title || sc.sceneId;
+    div.querySelector('.pn-id').textContent = sc.sceneId;
+    div.insertAdjacentHTML('beforeend', stateChips(sc.state, result.knownVars));
+    if (sc.stateMatches === false) {
+      div.insertAdjacentHTML('beforeend', '<div class="cov-replay-flag">⚠ 实际状态与路线记录不一致</div>');
+    }
+    wrap.appendChild(div);
+
+    if (i < scenes.length - 1) {
+      const edge = optByStep.get(sc.step);
+      if (edge) {
+        const e = document.createElement('div');
+        e.className = 'path-edge';
+        e.appendChild(document.createTextNode(
+          `选项 ${edge.optionIndex + 1}「${edge.optionText || ''}」 → ${edge.target}`));
+        if (edge.optionUid) {
+          const uid = document.createElement('code');
+          uid.className = 'cov-uid';
+          uid.textContent = edge.optionUid;
+          e.appendChild(uid);
+        }
+        wrap.appendChild(e);
+      }
+    }
+  });
+  return wrap;
+}
+
+/** 当前场景卡片：正文、变量状态（期望/实际）、当前可见选项（标注路线下一步） */
+function buildReplaySceneCard(scene, result, replay) {
+  const card = document.createElement('div');
+  card.className = 'cov-replay-scene';
+
+  const title = document.createElement('div');
+  title.className = 'cov-replay-scene-head';
+  title.innerHTML = `<b></b><code></code>`;
+  title.querySelector('b').textContent = scene.title || scene.sceneId;
+  title.querySelector('code').textContent = scene.sceneId;
+  card.appendChild(title);
+
+  if (scene.text) {
+    const text = document.createElement('div');
+    text.className = 'cov-replay-scene-text';
+    text.textContent = scene.text;
+    card.appendChild(text);
+  }
+
+  // 变量状态（实际）；与期望不一致时逐条标出
+  const stateLabel = document.createElement('div');
+  stateLabel.className = 'cov-section-label';
+  stateLabel.textContent = '变量状态（当前草稿实际计算）';
+  card.appendChild(stateLabel);
+  card.insertAdjacentHTML('beforeend', stateChips(scene.state, result.knownVars));
+
+  if (scene.stateMatches === false && scene.stateDiff && scene.stateDiff.length) {
+    card.appendChild(buildStateDiffTable(scene.stateDiff));
+  }
+
+  // 当前场景的选项列表
+  const optLabel = document.createElement('div');
+  optLabel.className = 'cov-section-label';
+  const hasExpectedNext = (scene.options || []).some((o) => o.isExpectedNext);
+  optLabel.textContent = hasExpectedNext
+    ? '本场景选项（路线下一步已高亮）'
+    : '本场景选项（当前草稿）';
+  card.appendChild(optLabel);
+
+  if (!scene.options || !scene.options.length) {
+    const none = document.createElement('div');
+    none.className = 'pq-note';
+    none.textContent = '该场景没有任何选项（路线到此结束）。';
+    card.appendChild(none);
+    return card;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'cov-replay-opts';
+  for (const o of scene.options) {
+    const row = document.createElement('div');
+    row.className = 'cov-replay-opt'
+      + (o.isExpectedNext ? ' is-next' : '')
+      + (o.walkable ? '' : ' is-blocked');
+    const head = document.createElement('div');
+    head.className = 'cov-replay-opt-head';
+    const why = [];
+    if (!o.conditionOk) why.push('条件不成立');
+    if (o.target && !o.targetExists) why.push('目标场景不存在');
+    else if (!o.target) why.push('未设置目标');
+    if (o.targetExists && !o.entryOk) why.push('目标前置不成立');
+    head.innerHTML = `<span class="cov-replay-opt-name"></span>`
+      + (o.uid ? '<code class="cov-uid"></code>' : '')
+      + (o.isExpectedNext ? '<span class="badge badge-req">路线下一步</span>' : '')
+      + (o.walkable ? '<span class="badge badge-ok">可走</span>'
+        : `<span class="badge badge-warn">${why.join(' / ') || '不可走'}</span>`);
+    head.querySelector('.cov-replay-opt-name').textContent =
+      `${o.index + 1}.「${o.text || '（无文案）'}」 → ${o.target || '（不跳转）'}`;
+    if (o.uid) head.querySelector('code.cov-uid').textContent = o.uid;
+    row.appendChild(head);
+    if (o.condition) {
+      const cond = document.createElement('div');
+      cond.className = 'cov-replay-opt-cond';
+      cond.textContent = `显示条件：${o.condition}`;
+      row.appendChild(cond);
+    }
+    list.appendChild(row);
+  }
+  card.appendChild(list);
+  return card;
+}
+
+/** 期望 / 实际变量取值对照表 */
+function buildStateDiffTable(diff) {
+  const wrap = document.createElement('div');
+  wrap.className = 'cov-diff-table';
+  const head = document.createElement('div');
+  head.className = 'cov-diff-row cov-diff-head-row';
+  head.innerHTML = '<span>变量</span><span>路线期望</span><span>当前实际</span>';
+  wrap.appendChild(head);
+  for (const d of diff) {
+    const row = document.createElement('div');
+    row.className = 'cov-diff-row';
+    row.innerHTML = `<code></code><span class="cov-diff-want"></span><span class="cov-diff-actual"></span>`;
+    row.querySelector('code').textContent = d.variable;
+    const want = row.querySelector('.cov-diff-want');
+    want.textContent = d.expected ? 'true' : 'false';
+    want.classList.add(d.expected ? 'val-true' : 'val-false');
+    const actual = row.querySelector('.cov-diff-actual');
+    actual.textContent = d.actual ? 'true' : 'false';
+    actual.classList.add(d.actual ? 'val-true' : 'val-false');
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+/** 分歧点卡片：原因 + 期望/实际对照 + 未满足条件解释 + 重新生成入口 */
+function buildDivergenceCard(result) {
+  const d = result.divergence;
+  const meta = REPLAY_DIVERGENCE_META[d.kind] || { label: d.kind, cls: 'pq-err' };
+  const card = document.createElement('div');
+  card.className = `pq-banner ${meta.cls} cov-divergence`;
+
+  const head = document.createElement('div');
+  head.className = 'cov-divergence-head';
+  const where = d.stopStep > d.step
+    ? `执行第 ${d.step + 1} 个选项后（第 ${d.stopStep} 步场景）`
+    : `第 ${d.step + 1} 个选项前（第 ${d.step} 步场景）`;
+  head.innerHTML = `<b>⛔ 首个分歧点 · ${where}：${meta.label}</b>`;
+  card.appendChild(head);
+
+  const reason = document.createElement('div');
+  reason.className = 'cov-divergence-reason';
+  reason.textContent = d.reason;
+  card.appendChild(reason);
+
+  // 选项 / 场景定位对照
+  const facts = document.createElement('div');
+  facts.className = 'cov-divergence-facts';
+  const addFact = (label, value) => {
+    if (value === null || value === undefined || value === '') return;
+    const row = document.createElement('div');
+    row.innerHTML = `<span class="cov-fact-label"></span>`;
+    row.querySelector('.cov-fact-label').textContent = label;
+    const val = document.createElement('code');
+    val.textContent = typeof value === 'boolean' ? String(value) : value;
+    row.appendChild(val);
+    facts.appendChild(row);
+  };
+  if (d.expectedUid) addFact('期望选项 UID：', d.expectedUid);
+  if (d.optionText) addFact('选项文案：', d.optionText);
+  if (d.expectedSceneId) addFact('期望所在场景：', d.expectedSceneId);
+  if (d.actualSceneId && d.actualSceneId !== d.expectedSceneId && d.kind === 'startSceneChanged') {
+    addFact('当前起点场景：', d.actualSceneId);
+  }
+  if (d.foundSceneId && d.foundSceneId !== d.expectedSceneId) addFact('实际所在场景：', d.foundSceneId);
+  if (d.expectedTarget) addFact('路线记录目标：', d.expectedTarget);
+  if (d.actualTarget && d.actualTarget !== d.expectedTarget) addFact('当前跳转目标：', d.actualTarget);
+  if (d.target !== undefined && !d.actualTarget) addFact('当前目标：', d.target || '（空）');
+  card.appendChild(facts);
+
+  // 状态期望 / 实际对照
+  if (d.stateDiff && d.stateDiff.length) {
+    const label = document.createElement('div');
+    label.className = 'cov-divergence-state-label';
+    label.textContent = '变量状态期望 / 实际不一致：';
+    card.appendChild(label);
+    card.appendChild(buildStateDiffTable(d.stateDiff));
+  }
+
+  // 未满足条件解释树（选项条件 / 目标前置 / 起点前置）
+  if (d.unmet) {
+    const label = document.createElement('div');
+    label.className = 'cov-divergence-state-label';
+    label.textContent = '未满足的条件（逐层期望值 / 实际值）：';
+    card.appendChild(label);
+    const unmet = document.createElement('div');
+    unmet.className = 'cov-replay-unmet';
+    unmet.appendChild(renderExprNode(d.unmet));
+    card.appendChild(unmet);
+  }
+
+  const regen = document.createElement('button');
+  regen.className = 'btn btn-small btn-primary cov-divergence-regen';
+  regen.textContent = '🔄 一键重新生成覆盖路线';
+  regen.addEventListener('click', replayRegenerate);
+  card.appendChild(regen);
+  return card;
 }
 
 
