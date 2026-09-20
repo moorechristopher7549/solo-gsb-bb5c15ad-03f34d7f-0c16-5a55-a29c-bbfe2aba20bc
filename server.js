@@ -7,6 +7,7 @@ const { analyze } = require('./src/analyzer');
 const { queryPath } = require('./src/pathquery');
 const { inferEndings } = require('./src/probability');
 const { planCoverage } = require('./src/coverage');
+const { replayRoute } = require('./src/replay');
 const { buildBaseline, compareWithBaseline } = require('./src/baseline');
 
 const app = express();
@@ -115,6 +116,26 @@ app.get('/api/stories/:id/coverage', wrap((req, res) => {
   const story = storage.getStory(req.params.id);
   if (!story) return res.status(404).json({ error: '剧情不存在' });
   res.json(planCoverage(story));
+}));
+
+// ---- 覆盖路线逐步回放：用路线中的稳定选项 UID 序列在当前草稿上从起点逐步重放 ----
+// 请求体：{ story: <剧情>, route: { options: [uid, ...], path? } }
+// 每一步用当前草稿重新校验选项条件、目标场景前置条件与状态赋值；草稿变化导致
+// UID 缺失 / 状态不一致时停在首个分歧点（divergence），返回期望 / 实际状态。
+// 只读剧情，不保存、不修改草稿。
+app.post('/api/coverage/replay', wrap((req, res) => {
+  const body = req.body || {};
+  const story = body.story !== undefined ? body.story : body;
+  res.json(replayRoute(story, body.route || {}));
+}));
+
+// ---- 对已保存剧情做覆盖路线逐步回放（请求体即 route） ----
+app.post('/api/stories/:id/coverage/replay', wrap((req, res) => {
+  const story = storage.getStory(req.params.id);
+  if (!story) return res.status(404).json({ error: '剧情不存在' });
+  const body = req.body || {};
+  const route = body.route !== undefined ? body.route : body;
+  res.json(replayRoute(story, route));
 }));
 
 // ---- 分析基线：把当前（通常是编辑中的）分析结果保存为基线，随剧情 JSON 持久化 ----

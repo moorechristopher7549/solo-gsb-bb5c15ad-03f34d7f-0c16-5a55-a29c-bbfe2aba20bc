@@ -199,6 +199,20 @@ npm start
 
 响应要点：`coverage`（`coverable` 分母 / `covered` 已覆盖 / `rate` 覆盖率）、`counts`（选项总数、路线数、具体状态数等）、`routes`（每条含 `depth`、`covers` / `newlyCovered` 选项 UID 数组、`path` 每步场景与状态）、`excludedOptions`（未计入分母的选项及原因）、`complete` / `truncated`、`conditionErrors`。完整（未截断）时必有 `covered = coverable`、`rate = 1`。
 
+## 覆盖路线逐步回放
+
+生成覆盖路线后，每条路线的标题栏都有 **「▶ 逐步回放」** 按钮（编辑页右侧「选项覆盖路线」面板内，展开任一条路线即可看到）。点击后进入该路线的逐步回放，再点一次（或「■ 结束回放」）退出：
+
+1. **从起点开始、按路线中的稳定选项 UID 逐步前进**：用「上一步 / 下一步 / 回到起点」控制进度，轨迹同步显示**当前场景、完整变量状态**，以及**下一步选项**（UID、文案、跳转目标与显示条件）；
+2. **每一步都用当前草稿重新校验**，而不是直接信任路线生成时的快照：重新求值**选项条件**、校验**目标场景存在**、应用选项与目标场景的**状态赋值**后重新求值**目标场景前置条件**，并把推导出的状态与路线记录的期望状态逐位对比；
+3. 草稿相对生成路线时已变化（选项被删 / 被拖动到别的场景、条件翻假、目标消失或改指、赋值变化、起点变化等）时，**停在首个分歧点**，不再继续。分歧面板按步骤给出**原因**与**期望 / 实际**两侧对照：场景与目标、条件取值、完整变量状态，状态不一致时另附逐变量的「路线期望 / 草稿实际」差异表，条件类分歧还复用「未满足条件解释树」提示最少翻转哪些变量；
+4. 分歧面板提供 **「↻ 按当前草稿重新生成覆盖路线」** 一键重生成（等价于面板顶部按钮，同样针对编辑中的草稿、不落盘）；
+5. 回放**只读草稿，不会保存或修改剧情**；回放进行中继续编辑时，会用最新草稿防抖重新校验，分歧点变早则自动回停到更早的位置；路线结果上的「可能过期」提示逻辑与回放互不影响。
+
+分歧原因类型：`uidMissing`（UID 已缺失，选项可能被删除）、`optionMoved`（UID 被移动到别的场景）、`conditionFalse`（选项条件在当前状态下不成立）、`orphanTarget`（目标为空或场景不存在）、`targetChanged`（跳转目标与路线记录不一致）、`blockedEntry`（目标场景前置条件不成立）、`stateMismatch`（变量状态与期望位图不一致）、`startSceneChanged` / `startBlocked`（起点变化或起点前置不成立）。
+
+`POST /api/coverage/replay` 请求体为 `{ story, route: { options: [UID, ...], path? } }`（草稿不保存），已保存剧情可用 `POST /api/stories/:id/coverage/replay`（请求体即 `route`）。响应要点：`completed`（是否无分歧走完全程）、`total`、`trace.start` / `trace.steps`（每步含场景、UID、条件原文与求值结果、目标、选择前后状态）、`trace.end`、`divergence`（首个分歧点的 `reason` / `atStep` / `uid` / `sceneId` / `target` / `expected` / `actual` / `stateDiffs` / `explain`，无分歧时为 `null`）。分歧属于正常业务结果（HTTP 200），仅参数错误（缺少选项序列、起点无效等）返回 400。
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -216,6 +230,8 @@ npm start
 | `GET` | `/api/stories/:id/probability` | 对已保存剧情做结局概率推演 |
 | `POST` | `/api/coverage` | 选项覆盖路线：对请求体中的草稿剧情直接生成（不落盘），请求体即剧情或 `{ story }` |
 | `GET` | `/api/stories/:id/coverage` | 对已保存剧情生成选项覆盖路线 |
+| `POST` | `/api/coverage/replay` | 覆盖路线逐步回放：对请求体中的草稿剧情重放（不保存、不修改草稿），请求体 `{ story, route: { options, path? } }` |
+| `POST` | `/api/stories/:id/coverage/replay` | 对已保存剧情做覆盖路线逐步回放，请求体即 `route` |
 | `POST` | `/api/stories/:id/baseline` | 把请求体中的剧情分析结果保存为基线（同时落盘剧情），返回 `{ story, baseline, analysis }` |
 | `POST` | `/api/stories/:id/baseline/compare` | 基线对比；请求体可省略（对比已保存剧情）或传入编辑中的草稿，返回 `{ summary, items }` |
 | `DELETE` | `/api/stories/:id/baseline` | 删除基线（剧情内容不变） |
@@ -240,13 +256,14 @@ npm start
 
 ```
 .
-├── server.js              # Express 入口与 REST API（含基线、目标路径查询、结局概率推演、选项覆盖路线接口）
+├── server.js              # Express 入口与 REST API（含基线、目标路径查询、结局概率推演、选项覆盖路线与逐步回放接口）
 ├── src/
 │   ├── expression.js      # 布尔表达式递归下降解析器 / 求值 / 失败解释
 │   ├── analyzer.js        # 「场景+状态」BFS 传播去重分析引擎（附带问题指纹）
 │   ├── pathquery.js       # 目标路径查询：必经序号+场景+状态 BFS 求最短链 / 差异最少状态
 │   ├── probability.js     # 结局概率推演：状态图展开、SCC 分解、吸收概率精确求解
 │   ├── coverage.js        # 选项覆盖路线：可走选项见证路径 + 确定性贪心集合覆盖压缩
+│   ├── replay.js          # 覆盖路线逐步回放：按稳定 UID 用当前草稿逐步重校验，停在首个分歧点
 │   ├── weight.js          # 选项正整数权重的统一校验（保存 / 导入 / 推演共用）
 │   ├── fingerprint.js     # 不依赖数组顺序的问题稳定指纹
 │   ├── baseline.js        # 基线快照构建与新增/已修复/仍存在/详情变化对比
@@ -264,6 +281,7 @@ npm start
 │   ├── pathquery.js       # 目标路径查询与 API 自检（node test/pathquery.js）
 │   ├── probability.js     # 结局概率推演核心算法与 API 自检（node test/probability.js）
 │   ├── coverage.js        # 选项覆盖路线与 API 自检（node test/coverage.js）
+│   ├── replay.js          # 覆盖路线逐步回放与 API 自检（node test/replay.js）
 │   └── healthcheck.js     # 健康检查探针回归测试（node test/healthcheck.js）
 ├── Dockerfile
 └── docker-compose.yml
@@ -272,7 +290,7 @@ npm start
 自检：
 
 ```bash
-npm test          # 依次运行 smoke.js、baseline.js、pathquery.js、probability.js、coverage.js 与 healthcheck.js
+npm test          # 依次运行 smoke.js、baseline.js、pathquery.js、probability.js、coverage.js、replay.js 与 healthcheck.js
 ```
 
 ## 技术栈
